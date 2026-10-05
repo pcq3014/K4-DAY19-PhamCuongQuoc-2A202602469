@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import importlib
 import os
+import re
+import sys
 import time
 from dataclasses import dataclass, fields
 from typing import Any
@@ -37,6 +39,7 @@ PRICES_PER_M = {
     "text-embedding-3-small": (0.02, 0.0),
     "text-embedding-3-large": (0.13, 0.0),
     "gemini-2.5-flash-lite": (0.10, 0.40),
+    "gemini-3.5-flash-lite": (0.30, 2.50),   # ai.google.dev/gemini-api/docs/pricing, paid tier, 2026-10
     # Gemini embedding pricing intentionally omitted: the current pricing page does not list gemini-embedding-001.
     "claude-opus-5-5": (4.00, 20.00),
     "claude-sonnet-5-5": (2.00, 10.00),
@@ -104,6 +107,7 @@ class MeteredLLM:
         self.embedding_model = f"{self.embed_provider}:{self.embed_model_id}"
         self._backend_name = self.embedding_model
         self.usage = Usage()
+        self.rate_limit_wait = 0.0   # seconds slept on HTTP 429 (free tiers); included in wall-clock latency
         self._chat_client: Any
         self._embed_client: Any
         if self.chat_provider == "anthropic":
@@ -114,24 +118,38 @@ class MeteredLLM:
         self._embed_client = (self._chat_client if self.embed_provider == self.chat_provider
                               else _openai_client(self.embed_provider))
 
+    def _retry(self, call: Any, attempts: int = 8) -> Any:
+        """Free-tier quotas (e.g. Gemini 15 req/min) answer 429: wait the advertised delay, then retry."""
+        for attempt in range(attempts):
+            try:
+                return call()
+            except Exception as error:   # openai.RateLimitError / anthropic.RateLimitError
+                if getattr(error, "status_code", None) != 429 or attempt == attempts - 1:
+                    raise
+                hint = re.search(r"retry in ([\d.]+)s", str(error))
+                delay = float(hint.group(1)) + 1 if hint else 20.0 * (attempt + 1)
+                print(f"[rate-limit 429] chờ {delay:.0f}s rồi gọi lại", file=sys.stderr, flush=True)
+                time.sleep(delay)
+                self.rate_limit_wait += delay
+
     def chat(self, prompt: str, json_mode: bool = False) -> str:
         start = time.perf_counter()
         if self.chat_provider == "anthropic":
-            text, model, tokens_in, tokens_out = self._chat_anthropic(prompt)
+            text, model, tokens_in, tokens_out = self._retry(lambda: self._chat_anthropic(prompt))
         else:
             if json_mode and self.chat_provider != "gemini":
-                response = self._chat_client.chat.completions.create(
+                response = self._retry(lambda: self._chat_client.chat.completions.create(
                     model=self.chat_model_id,
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0,
                     response_format={"type": "json_object"},
-                )
+                ))
             else:
-                response = self._chat_client.chat.completions.create(
+                response = self._retry(lambda: self._chat_client.chat.completions.create(
                     model=self.chat_model_id,
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0,
-                )
+                ))
             text, model = response.choices[0].message.content or "", self.chat_model_id
             usage = response.usage
             tokens_in = usage.prompt_tokens if usage else 0
@@ -158,7 +176,7 @@ class MeteredLLM:
 
     def embed(self, text: str) -> list[float]:
         start = time.perf_counter()
-        response = self._embed_client.embeddings.create(model=self.embed_model_id, input=text)
+        response = self._retry(lambda: self._embed_client.embeddings.create(model=self.embed_model_id, input=text))
         tokens = getattr(response.usage, "prompt_tokens", 0) or 0   # some OpenAI-compatible APIs omit usage
         self.usage += Usage(1, tokens, 0, price(self.embed_model_id, tokens), time.perf_counter() - start)
         return [float(value) for value in response.data[0].embedding]
